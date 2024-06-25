@@ -1,217 +1,231 @@
-// Copyright 2016 The go-ethereum Authors
-// This file is part of the go-ethereum library.
-//
-// The go-ethereum library is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Lesser General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
-//
-// The go-ethereum library is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Lesser General Public License for more details.
-//
-// You should have received a copy of the GNU Lesser General Public License
-// along with the go-ethereum library. If not, see <http://www.gnu.org/licenses/>.
+// Copyright 2016 The Go Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
 
-// Package interfaces defines interfaces for interacting with Quai.
-package interfaces
+// Package blake2b implements the BLAKE2b hash algorithm defined by RFC 7693
+// and the extendable output function (XOF) BLAKE2Xb.
+//
+// For a detailed specification of BLAKE2b see https://blake2.net/blake2.pdf
+// and for BLAKE2Xb see https://blake2.net/blake2x.pdf
+//
+// If you aren't sure which function you need, use BLAKE2b (Sum512 or New512).
+// If you need a secret-key MAC (message authentication code), use the New512
+// function with a non-nil key.
+//
+// BLAKE2X is a construction to compute hash values larger than 64 bytes. It
+// can produce hash values between 0 and 4 GiB.
+package blake2b
 
 import (
-	"context"
+	"encoding/binary"
 	"errors"
-	"math/big"
-
-	"github.com/dominant-strategies/go-quai/common"
-	"github.com/dominant-strategies/go-quai/core/types"
+	"hash"
 )
 
-// NotFound is returned by API methods if the requested item does not exist.
-var NotFound = errors.New("not found")
+const (
+	// The blocksize of BLAKE2b in bytes.
+	BlockSize = 128
+	// The hash size of BLAKE2b-512 in bytes.
+	Size = 64
+	// The hash size of BLAKE2b-384 in bytes.
+	Size384 = 48
+	// The hash size of BLAKE2b-256 in bytes.
+	Size256 = 32
+)
 
-// TODO: move subscription to package event
+var (
+	useAVX2 bool
+	useAVX  bool
+	useSSE4 bool
+)
 
-// Subscription represents an event subscription where events are
-// delivered on a data channel.
-type Subscription interface {
-	// Unsubscribe cancels the sending of events to the data channel
-	// and closes the error channel.
-	Unsubscribe()
-	// Err returns the subscription error channel. The error channel receives
-	// a value if there is an issue with the subscription (e.g. the network connection
-	// delivering the events has been closed). Only one value will ever be sent.
-	// The error channel is closed by Unsubscribe.
-	Err() <-chan error
+var (
+	errKeySize  = errors.New("blake2b: invalid key size")
+	errHashSize = errors.New("blake2b: invalid hash size")
+)
+
+var iv = [8]uint64{
+	0x6a09e667f3bcc908, 0xbb67ae8584caa73b, 0x3c6ef372fe94f82b, 0xa54ff53a5f1d36f1,
+	0x510e527fade682d1, 0x9b05688c2b3e6c1f, 0x1f83d9abfb41bd6b, 0x5be0cd19137e2179,
 }
 
-// ChainReader provides access to the blockchain. The methods in this interface access raw
-// data from either the canonical chain (when requesting by block number) or any
-// blockchain fork that was previously downloaded and processed by the node. The block
-// number argument can be nil to select the latest canonical block. Reading block headers
-// should be preferred over full blocks whenever possible.
+// Sum512 returns the BLAKE2b-512 checksum of the data.
+func Sum512(data []byte) [Size]byte {
+	var sum [Size]byte
+	checkSum(&sum, Size, data)
+	return sum
+}
+
+// Sum384 returns the BLAKE2b-384 checksum of the data.
+func Sum384(data []byte) [Size384]byte {
+	var sum [Size]byte
+	var sum384 [Size384]byte
+	checkSum(&sum, Size384, data)
+	copy(sum384[:], sum[:Size384])
+	return sum384
+}
+
+// Sum256 returns the BLAKE2b-256 checksum of the data.
+func Sum256(data []byte) [Size256]byte {
+	var sum [Size]byte
+	var sum256 [Size256]byte
+	checkSum(&sum, Size256, data)
+	copy(sum256[:], sum[:Size256])
+	return sum256
+}
+
+// New512 returns a new hash.Hash computing the BLAKE2b-512 checksum. A non-nil
+// key turns the hash into a MAC. The key must be between zero and 64 bytes long.
+func New512(key []byte) (hash.Hash, error) { return newDigest(Size, key) }
+
+// New384 returns a new hash.Hash computing the BLAKE2b-384 checksum. A non-nil
+// key turns the hash into a MAC. The key must be between zero and 64 bytes long.
+func New384(key []byte) (hash.Hash, error) { return newDigest(Size384, key) }
+
+// New256 returns a new hash.Hash computing the BLAKE2b-256 checksum. A non-nil
+// key turns the hash into a MAC. The key must be between zero and 64 bytes long.
+func New256(key []byte) (hash.Hash, error) { return newDigest(Size256, key) }
+
+// New returns a new hash.Hash computing the BLAKE2b checksum with a custom length.
+// A non-nil key turns the hash into a MAC. The key must be between zero and 64 bytes long.
+// The hash size can be a value between 1 and 64 but it is highly recommended to use
+// values equal or greater than:
+// - 32 if BLAKE2b is used as a hash function (The key is zero bytes long).
+// - 16 if BLAKE2b is used as a MAC function (The key is at least 16 bytes long).
+// When the key is nil, the returned hash.Hash implements BinaryMarshaler
+// and BinaryUnmarshaler for state (de)serialization as documented by hash.Hash.
+func New(size int, key []byte) (hash.Hash, error) { return newDigest(size, key) }
+
+// F is a compression function for BLAKE2b. It takes as an argument the state
+// vector `h`, message block vector `m`, offset counter `t`, final block indicator
+// flag `f`, and number of rounds `rounds`. The state vector provided as the first
+// parameter is modified by the function.
+func F(h *[8]uint64, m [16]uint64, c [2]uint64, final bool, rounds uint32) {
+	var flag uint64
+	if final {
+		flag = 0xFFFFFFFFFFFFFFFF
+	}
+	f(h, &m, c[0], c[1], flag, uint64(rounds))
+}
+
+func newDigest(hashSize int, key []byte) (*digest, error) {
+	if hashSize < 1 || hashSize > Size {
+		return nil, errHashSize
+	}
+	if len(key) > Size {
+		return nil, errKeySize
+	}
+	d := &digest{
+		size:   hashSize,
+		keyLen: len(key),
+	}
+	copy(d.key[:], key)
+	d.Reset()
+	return d, nil
+}
+
+func checkSum(sum *[Size]byte, hashSize int, data []byte) {
+	h := iv
+	h[0] ^= uint64(hashSize) | (1 << 16) | (1 << 24)
+	var c [2]uint64
+
+	if length := len(data); length > BlockSize {
+		n := length &^ (BlockSize - 1)
+		if length == n {
+			n -= BlockSize
+		}
+		hashBlocks(&h, &c, 0, data[:n])
+		data = data[n:]
+	}
+
+	var block [BlockSize]byte
+	offset := copy(block[:], data)
+	remaining := uint64(BlockSize - offset)
+	if c[0] < remaining {
+		c[1]--
+	}
+	c[0] -= remaining
+
+	hashBlocks(&h, &c, 0xFFFFFFFFFFFFFFFF, block[:])
+
+	for i, v := range h[:(hashSize+7)/8] {
+		binary.LittleEndian.PutUint64(sum[8*i:], v)
+	}
+}
+
+func hashBlocks(h *[8]uint64, c *[2]uint64, flag uint64, blocks []byte) {
+	var m [16]uint64
+	c0, c1 := c[0], c[1]
+
+	for i := 0; i < len(blocks); {
+		c0 += BlockSize
+		if c0 < BlockSize {
+			c1++
+		}
+		for j := range m {
+			m[j] = binary.LittleEndian.Uint64(blocks[i:])
+			i += 8
+		}
+		f(h, &m, c0, c1, flag, 12)
+	}
+	c[0], c[1] = c0, c1
+}
+
+type digest struct {
+	h      [8]uint64
+	c      [2]uint64
+	size   int
+	block  [BlockSize]byte
+	offset int
+
+	key    [BlockSize]byte
+	keyLen int
+}
+
+const (
+	magic         = "b2b"
+	marshaledSize = len(magic) + 8*8 + 2*8 + 1 + BlockSize + 1
+)
+
+func (d *digest) MarshalBinary() ([]byte, error) {
+	if d.keyLen != 0 {
+		return nil, errors.New("crypto/blake2b: cannot marshal MACs")
+	}
+	b := make([]byte, 0, marshaledSize)
+	b = append(b, magic...)
+	for i := 0; i < 8; i++ {
+		b = appendUint64(b, d.h[i])
+	}
+	b = appendUint64(b, d.c[0])
+	b = appendUint64(b, d.c[1])
+	// Maximum value for size is 64
+	b = append(b, byte(d.size))
+	b = append(b, d.block[:]...)
+	b = append(b, byte(d.offset))
+	return b, nil
+}
+
+func (d *digest) UnmarshalBinary(b []byte) error {
+	if len(b) < len(magic) || string(b[:len(magic)]) != magic {
+		return errors.New("crypto/blake2b: invalid hash state identifier")
+	}
+	if len(b) != marshaledSize {
+		return errors.New("crypto/blake2b: invalid hash state size")
+	}
+	b = b[len(magic):]
+	for i := 0; i < 8; i++ {
+		b, d.h[i] = consumeUint64(b)
+İşte düzeltilmiş metin:
+
+```go
+// Copyright 2017 The Go Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
+
+// Package blake2b implements the BLAKE2b hash algorithm defined by RFC 7693
+// and the extendable output function (XOF) BLAKE2Xb.
 //
-// The returned error is NotFound if the requested item does not exist.
-type ChainReader interface {
-	BlockByHash(ctx context.Context, hash common.Hash) (*types.WorkObject, error)
-	BlockByNumber(ctx context.Context, number *big.Int) (*types.WorkObject, error)
-	HeaderByHash(ctx context.Context, hash common.Hash) (*types.WorkObject, error)
-	HeaderByNumber(ctx context.Context, number *big.Int) (*types.WorkObject, error)
-	TransactionCount(ctx context.Context, blockHash common.Hash) (uint, error)
-	TransactionInBlock(ctx context.Context, blockHash common.Hash, index uint) (*types.Transaction, error)
-
-	// This method subscribes to notifications about changes of the head block of
-	// the canonical chain.
-	SubscribeNewHead(ctx context.Context, ch chan<- *types.WorkObject) (Subscription, error)
-}
-
-// TransactionReader provides access to past transactions and their receipts.
-// Implementations may impose arbitrary restrictions on the transactions and receipts that
-// can be retrieved. Historic transactions may not be available.
+// For a detailed specification of BLAKE2b see https://blake2.net/blake2.pdf
+// and for BLAKE2Xb see https://blake2.net/blake2x.pdf
 //
-// Avoid relying on this interface if possible. Contract logs (through the LogFilterer
-// interface) are more reliable and usually safer in the presence of chain
-// reorganisations.
-//
-// The returned error is NotFound if the requested item does not exist.
-type TransactionReader interface {
-	// TransactionByHash checks the pool of pending transactions in addition to the
-	// blockchain. The isPending return value indicates whether the transaction has been
-	// mined yet. Note that the transaction may not be part of the canonical chain even if
-	// it's not pending.
-	TransactionByHash(ctx context.Context, txHash common.Hash) (tx *types.Transaction, isPending bool, err error)
-	// TransactionReceipt returns the receipt of a mined transaction. Note that the
-	// transaction may not be included in the current canonical chain even if a receipt
-	// exists.
-	TransactionReceipt(ctx context.Context, txHash common.Hash) (*types.Receipt, error)
-}
-
-// ChainStateReader wraps access to the state trie of the canonical blockchain. Note that
-// implementations of the interface may be unable to return state values for old blocks.
-// In many cases, using CallContract can be preferable to reading raw contract storage.
-type ChainStateReader interface {
-	BalanceAt(ctx context.Context, account common.Address, blockNumber *big.Int) (*big.Int, error)
-	StorageAt(ctx context.Context, account common.Address, key common.Hash, blockNumber *big.Int) ([]byte, error)
-	CodeAt(ctx context.Context, account common.Address, blockNumber *big.Int) ([]byte, error)
-	NonceAt(ctx context.Context, account common.Address, blockNumber *big.Int) (uint64, error)
-}
-
-// SyncProgress gives progress indications when the node is synchronising with
-// the Quai network.
-type SyncProgress struct {
-	StartingBlock uint64 // Block number where sync began
-	CurrentBlock  uint64 // Current block number where sync is at
-	HighestBlock  uint64 // Highest alleged block number in the chain
-	PulledStates  uint64 // Number of state trie entries already downloaded
-	KnownStates   uint64 // Total number of state trie entries known about
-}
-
-// ChainSyncReader wraps access to the node's current sync status. If there's no
-// sync currently running, it returns nil.
-type ChainSyncReader interface {
-	SyncProgress(ctx context.Context) (*SyncProgress, error)
-}
-
-// CallMsg contains parameters for contract calls.
-type CallMsg struct {
-	From      common.Address  // the sender of the 'transaction'
-	To        *common.Address // the destination contract (nil for contract creation)
-	Gas       uint64          // if 0, the call executes with near-infinite gas
-	GasPrice  *big.Int        // wei <-> gas exchange ratio
-	GasFeeCap *big.Int        // fee cap per gas.
-	GasTipCap *big.Int        // tip per gas.
-	Value     *big.Int        // amount of wei sent along with the call
-	Data      []byte          // input data, usually an ABI-encoded contract method invocation
-
-	AccessList types.AccessList // access list
-}
-
-// A ContractCaller provides contract calls, essentially transactions that are executed by
-// the EVM but not mined into the blockchain. ContractCall is a low-level method to
-// execute such calls. For applications which are structured around specific contracts,
-// the abigen tool provides a nicer, properly typed way to perform calls.
-type ContractCaller interface {
-	CallContract(ctx context.Context, call CallMsg, blockNumber *big.Int) ([]byte, error)
-}
-
-// FilterQuery contains options for contract log filtering.
-type FilterQuery struct {
-	BlockHash *common.Hash     // used by eth_getLogs, return logs only from block with this hash
-	FromBlock *big.Int         // beginning of the queried range, nil means genesis block
-	ToBlock   *big.Int         // end of the range, nil means latest block
-	Addresses []common.Address // restricts matches to events created by specific contracts
-
-	// The Topic list restricts matches to particular event topics. Each event has a list
-	// of topics. Topics matches a prefix of that list. An empty element slice matches any
-	// topic. Non-empty elements represent an alternative that matches any of the
-	// contained topics.
-	//
-	// Examples:
-	// {} or nil          matches any topic list
-	// {{A}}              matches topic A in first position
-	// {{}, {B}}          matches any topic in first position AND B in second position
-	// {{A}, {B}}         matches topic A in first position AND B in second position
-	// {{A, B}, {C, D}}   matches topic (A OR B) in first position AND (C OR D) in second position
-	Topics [][]common.Hash
-
-	NodeLocation common.Location
-}
-
-// LogFilterer provides access to contract log events using a one-off query or continuous
-// event subscription.
-//
-// Logs received through a streaming query subscription may have Removed set to true,
-// indicating that the log was reverted due to a chain reorganisation.
-type LogFilterer interface {
-	FilterLogs(ctx context.Context, q FilterQuery) ([]types.Log, error)
-	SubscribeFilterLogs(ctx context.Context, q FilterQuery, ch chan<- types.Log) (Subscription, error)
-}
-
-// TransactionSender wraps transaction sending. The SendTransaction method injects a
-// signed transaction into the pending transaction pool for execution. If the transaction
-// was a contract creation, the TransactionReceipt method can be used to retrieve the
-// contract address after the transaction has been mined.
-//
-// The transaction must be signed and have a valid nonce to be included. Consumers of the
-// API can use package accounts to maintain local private keys and need can retrieve the
-// next available nonce using PendingNonceAt.
-type TransactionSender interface {
-	SendTransaction(ctx context.Context, tx *types.Transaction) error
-}
-
-// GasPricer wraps the gas price oracle, which monitors the blockchain to determine the
-// optimal gas price given current fee market conditions.
-type GasPricer interface {
-	SuggestGasPrice(ctx context.Context) (*big.Int, error)
-}
-
-// A PendingStateReader provides access to the pending state, which is the result of all
-// known executable transactions which have not yet been included in the blockchain. It is
-// commonly used to display the result of ’unconfirmed’ actions (e.g. wallet value
-// transfers) initiated by the user. The PendingNonceAt operation is a good way to
-// retrieve the next available transaction nonce for a specific account.
-type PendingStateReader interface {
-	PendingBalanceAt(ctx context.Context, account common.Address) (*big.Int, error)
-	PendingStorageAt(ctx context.Context, account common.Address, key common.Hash) ([]byte, error)
-	PendingCodeAt(ctx context.Context, account common.Address) ([]byte, error)
-	PendingNonceAt(ctx context.Context, account common.Address) (uint64, error)
-	PendingTransactionCount(ctx context.Context) (uint, error)
-}
-
-// PendingContractCaller can be used to perform calls against the pending state.
-type PendingContractCaller interface {
-	PendingCallContract(ctx context.Context, call CallMsg) ([]byte, error)
-}
-
-// GasEstimator wraps EstimateGas, which tries to estimate the gas needed to execute a
-// specific transaction based on the pending state. There is no guarantee that this is the
-// true gas limit requirement as other transactions may be added or removed by miners, but
-// it should provide a basis for setting a reasonable default.
-type GasEstimator interface {
-	EstimateGas(ctx context.Context, call CallMsg) (uint64, error)
-}
-
-// A PendingStateEventer provides access to real time notifications about changes to the
-// pending state.
-type PendingStateEventer interface {
-	SubscribePendingTransactions(ctx context.Context, ch chan<- *types.Transaction) (Subscription, error)
-}
+// If you aren't 
